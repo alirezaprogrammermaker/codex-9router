@@ -20,7 +20,8 @@ usage() {
 Codex via local 9Router
 
 Usage:
-  codex-9router.sh [prompt ...]   Open the interactive control panel
+  codex-9router.sh [prompt ...]   Start 9Router, then run Codex with the prompt
+  codex-9router.sh                Open the interactive control panel
   codex-9router.sh --dashboard    Start 9Router and show its dashboard URL
   codex-9router.sh --check        Run a read-only live response check
   codex-9router.sh --stop         Stop only a 9Router server started by this script
@@ -30,9 +31,11 @@ Optional environment:
   NINEROUTER_PORT   Local 9Router port (default: 20128)
   NINEROUTER_MODEL  Preselect a model id (default: apmix/deepseek-v4-flash-free)
 
-The panel lists live models, tests a model with a read-only Codex request,
-and launches Codex. Manage provider endpoints and provider credentials in
-the 9Router dashboard; this launcher does not edit 9Router's database.
+With a prompt, the launcher starts 9Router in the background and runs Codex
+directly after the gateway is ready. Without a prompt, it opens the interactive
+panel, which lists live models, tests a model with a read-only Codex request,
+and launches Codex. Manage provider endpoints and provider credentials in the
+9Router dashboard; this launcher does not edit 9Router's database.
 
 The script reads a local 9Router client key from its database and never stores
 provider secrets. Add provider endpoints and credentials in the 9Router dashboard.
@@ -189,7 +192,7 @@ process.stdin.on("end", () => {
   } catch (_) { process.exit(1); }
 })' 2>/dev/null) || fail "Could not load models from 9Router. Check the local server and its active provider."
 
-if [ -t 0 ]; then
+if [ -t 0 ] && [ "$#" -eq 0 ]; then
   mapfile -t MODEL_OPTIONS < <(printf '%s\n' "$MODEL_LIST" | sed '/^$/d' | sort -u)
   if [ "${#MODEL_OPTIONS[@]}" -gt 0 ]; then
     printf '\nModels available from 9Router:\n'

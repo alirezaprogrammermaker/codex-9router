@@ -22,9 +22,18 @@ chmod +x codex-9router.sh
 ./codex-9router.sh
 ```
 
-The interactive panel lists the models exposed by 9Router, lets you select a
-model, runs an optional read-only Codex test, opens the 9Router dashboard for
-provider/API-key management, and launches Codex.
+With no arguments, the interactive panel lists the models exposed by 9Router,
+lets you select a model, runs an optional read-only Codex test, opens the
+9Router dashboard for provider/API-key management, and launches Codex. Pass a
+prompt to start 9Router in the background and launch Codex directly after the
+gateway is ready:
+
+```sh
+./codex-9router.sh "Inspect this project and fix the failing task"
+```
+
+The launcher waits only for 9Router's readiness check, then Codex runs while
+9Router continues serving requests in the background.
 
 ```sh
 ./codex-9router.sh --dashboard  # show/open the local dashboard
