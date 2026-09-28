@@ -133,7 +133,9 @@ fi
 gateway_ready() {
   local status
   status=$("$CURL_BIN" -sS -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)
-  [ "$status" = 200 ]
+  # /login may redirect (for example to the dashboard); that still proves
+  # the local web server is accepting requests. Treat every 2xx/3xx as ready.
+  [[ "$status" =~ ^[23][0-9][0-9]$ ]]
 }
 
 if ! gateway_ready; then
@@ -158,6 +160,9 @@ if ! gateway_ready; then
   if [ "$ready" -ne 1 ]; then
     rm -f "$PID_FILE"
     if [ -f "$LOG_FILE" ]; then tail -n 25 "$LOG_FILE" >&2; fi
+    if grep -q 'EADDRINUSE' "$LOG_FILE" 2>/dev/null; then
+      fail "Port $PORT is already occupied, but 9Router did not answer its readiness check. Check the existing server and its logs at $LOG_FILE, or choose another port with NINEROUTER_PORT."
+    fi
     fail "9Router did not start. See $LOG_FILE for details."
   fi
 fi
