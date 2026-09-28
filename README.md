@@ -34,6 +34,9 @@ gateway is ready:
 
 The launcher waits only for 9Router's readiness check, then Codex runs while
 9Router continues serving requests in the background.
+If the configured port is held by an unresponsive 9Router server, the launcher
+stops that server before starting a replacement. It leaves unrelated processes
+alone and reports a port conflict instead.
 
 ```sh
 ./codex-9router.sh --dashboard  # show/open the local dashboard

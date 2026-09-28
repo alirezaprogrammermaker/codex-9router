@@ -141,8 +141,38 @@ gateway_ready() {
   [[ "$status" =~ ^[23][0-9][0-9]$ ]]
 }
 
+stop_unresponsive_router_on_port() {
+  local listener_pid process_args attempt
+  command -v lsof >/dev/null 2>&1 || return 0
+  while IFS= read -r listener_pid; do
+    [ -n "$listener_pid" ] || continue
+    process_args=$(ps -p "$listener_pid" -o args= 2>/dev/null || true)
+    case "$process_args" in
+      *custom-server.js*)
+        printf 'Stopping unresponsive 9Router process %s on port %s.\n' "$listener_pid" "$PORT" >&2
+        kill "$listener_pid" 2>/dev/null || true
+        for ((attempt=0; attempt<5; attempt++)); do
+          kill -0 "$listener_pid" 2>/dev/null || break
+          sleep 1
+        done
+        if kill -0 "$listener_pid" 2>/dev/null; then
+          process_args=$(ps -p "$listener_pid" -o args= 2>/dev/null || true)
+          case "$process_args" in
+            *custom-server.js*) kill -KILL "$listener_pid" 2>/dev/null || true ;;
+          esac
+        fi
+        ;;
+      *)
+        fail "Port $PORT is occupied by another process (PID $listener_pid); left it running. Choose another port with NINEROUTER_PORT."
+        ;;
+    esac
+  done < <(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+}
+
 if ! gateway_ready; then
+  stop_unresponsive_router_on_port
   mkdir -p "$LOG_DIR"
+  : >"$LOG_FILE"
   NODE_PATH_VALUE="$DATA_DIR/runtime/node_modules:$APP_ROOT/node_modules"
   EXISTING_NODE_PATH=$(printenv NODE_PATH 2>/dev/null || true)
   if [ -n "$EXISTING_NODE_PATH" ]; then NODE_PATH_VALUE="$NODE_PATH_VALUE:$EXISTING_NODE_PATH"; fi
@@ -155,16 +185,22 @@ if ! gateway_ready; then
     nohup "$NODE_BIN" --dns-result-order=ipv4first "$SERVER_JS" >>"$LOG_FILE" 2>&1 </dev/null &
     printf '%s\n' "$!" >"$PID_FILE"
   )
+  printf '9Router is running in the background; waiting for its endpoint to become ready ...\n'
   ready=0
   for ((attempt=0; attempt<40; attempt++)); do
     if gateway_ready; then ready=1; break; fi
+    if grep -q 'EADDRINUSE' "$LOG_FILE" 2>/dev/null; then
+      rm -f "$PID_FILE"
+      tail -n 25 "$LOG_FILE" >&2
+      fail "Port $PORT is occupied. The launcher left any process it could not identify as 9Router running; choose another port with NINEROUTER_PORT."
+    fi
     sleep 1
   done
   if [ "$ready" -ne 1 ]; then
     rm -f "$PID_FILE"
     if [ -f "$LOG_FILE" ]; then tail -n 25 "$LOG_FILE" >&2; fi
     if grep -q 'EADDRINUSE' "$LOG_FILE" 2>/dev/null; then
-      fail "Port $PORT is already occupied, but 9Router did not answer its readiness check. Check the existing server and its logs at $LOG_FILE, or choose another port with NINEROUTER_PORT."
+      fail "Port $PORT is already occupied, but its process could not be identified as an unresponsive 9Router. Check the server and logs at $LOG_FILE, or choose another port with NINEROUTER_PORT."
     fi
     fail "9Router did not start. See $LOG_FILE for details."
   fi
