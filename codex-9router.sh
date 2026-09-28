@@ -67,14 +67,37 @@ if [ "$MODE" = stop ]; then
   esac
   PROCESS_ARGS=$(ps -p "$SERVER_PID" -o args= 2>/dev/null || true)
   case "$PROCESS_ARGS" in
-    *custom-server.js*)
+    *9router/cli.js*|*9router\\cli.js*|next-server*)
+      pkill -P "$SERVER_PID" 2>/dev/null || true
       kill "$SERVER_PID" 2>/dev/null || true
+      for ((attempt=0; attempt<10; attempt++)); do
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        sleep 1
+      done
       rm -f "$PID_FILE"
       printf 'Stopped the 9Router server started by this launcher.\n'
       ;;
     *)
-      rm -f "$PID_FILE"
-      fail "PID $SERVER_PID is no longer the launcher-owned 9Router server; removed the stale PID file without stopping it."
+      candidates=()
+      while IFS= read -r candidate_pid; do
+        [ -n "$candidate_pid" ] || continue
+        candidate_args=$(ps -p "$candidate_pid" -o args= 2>/dev/null || true)
+        case "$candidate_args" in next-server*) candidates+=("$candidate_pid") ;; esac
+      done < <(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
+      if [ "${#candidates[@]}" -eq 1 ] && grep -Fq "Server: http://127.0.0.1:$PORT" "$LOG_FILE" 2>/dev/null && \
+        [ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)" != 000 ]; then
+        pkill -P "${candidates[0]}" 2>/dev/null || true
+        kill "${candidates[0]}" 2>/dev/null || true
+        for ((attempt=0; attempt<10; attempt++)); do
+          kill -0 "${candidates[0]}" 2>/dev/null || break
+          sleep 1
+        done
+        rm -f "$PID_FILE"
+        printf 'Stopped the detached 9Router server started by this launcher.\n'
+      else
+        rm -f "$PID_FILE"
+        fail "PID $SERVER_PID is no longer the launcher-owned 9Router server; removed the stale PID file without stopping an unverified process."
+      fi
       ;;
   esac
   exit 0
@@ -90,6 +113,13 @@ CURL_BIN=$(command -v curl || true)
 CODEX_BIN=$(command -v codex || true)
 ROUTER_BIN=$(command -v 9router || true)
 [ -n "$ROUTER_BIN" ] || { [ -f "$HOME/.local/lib/node_modules/9router/cli.js" ] && ROUTER_BIN="$HOME/.local/lib/node_modules/9router/cli.js"; }
+ROUTER_COMMAND=()
+if [ -n "$ROUTER_BIN" ]; then
+  case "$ROUTER_BIN" in
+    */cli.js) ROUTER_COMMAND=("$NODE_BIN" "$ROUTER_BIN") ;;
+    *) ROUTER_COMMAND=("$ROUTER_BIN") ;;
+  esac
+fi
 printf 'Preflight checks\n'
 for dependency in bash node curl codex 9router; do
   case "$dependency" in
@@ -112,13 +142,6 @@ CODEX_VERSION=$("$CODEX_BIN" --version 2>&1 | head -n 1 || true)
 printf '  [OK] Codex CLI %s\n' "$CODEX_VERSION"
 [ -f "$DB_FILE" ] || fail "9Router data was not found at $DB_FILE. Start and configure 9Router first."
 
-ROUTER_ENTRY=$("$NODE_BIN" -e 'process.stdout.write(require("fs").realpathSync(process.argv[1]))' "$ROUTER_BIN" 2>/dev/null || true)
-[ -n "$ROUTER_ENTRY" ] || fail "Could not resolve the 9Router installation path."
-ROUTER_ROOT=$(dirname "$ROUTER_ENTRY")
-APP_ROOT="$ROUTER_ROOT/app"
-SERVER_JS="$APP_ROOT/custom-server.js"
-[ -f "$SERVER_JS" ] || fail "The 9Router server files were not found under $APP_ROOT."
-
 LOCAL_API_KEY=$(NODE_NO_WARNINGS=1 "$NODE_BIN" -e '
 try {
   const { DatabaseSync } = require("node:sqlite");
@@ -134,11 +157,15 @@ if [ -z "$LOCAL_API_KEY" ] && command -v python3 >/dev/null 2>&1; then
 fi
 
 gateway_ready() {
-  local status
-  status=$("$CURL_BIN" -sS -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)
-  # /login may redirect (for example to the dashboard); that still proves
-  # the local web server is accepting requests. Treat every 2xx/3xx as ready.
-  [[ "$status" =~ ^[23][0-9][0-9]$ ]]
+  LAST_STATUS=$("$CURL_BIN" -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)
+  [ -n "$LAST_STATUS" ] || LAST_STATUS=000
+  [ "$LAST_STATUS" != 000 ]
+}
+
+LAST_STATUS=000
+
+port_is_open() {
+  (exec 9<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null
 }
 
 stop_unresponsive_router_on_port() {
@@ -146,55 +173,69 @@ stop_unresponsive_router_on_port() {
   command -v lsof >/dev/null 2>&1 || return 0
   while IFS= read -r listener_pid; do
     [ -n "$listener_pid" ] || continue
-    process_args=$(ps -p "$listener_pid" -o args= 2>/dev/null || true)
-    case "$process_args" in
-      *custom-server.js*)
-        printf 'Stopping unresponsive 9Router process %s on port %s.\n' "$listener_pid" "$PORT" >&2
-        kill "$listener_pid" 2>/dev/null || true
-        for ((attempt=0; attempt<5; attempt++)); do
-          kill -0 "$listener_pid" 2>/dev/null || break
-          sleep 1
-        done
-        if kill -0 "$listener_pid" 2>/dev/null; then
-          process_args=$(ps -p "$listener_pid" -o args= 2>/dev/null || true)
-          case "$process_args" in
-            *custom-server.js*) kill -KILL "$listener_pid" 2>/dev/null || true ;;
-          esac
-        fi
-        ;;
-      *)
-        fail "Port $PORT is occupied by another process (PID $listener_pid); left it running. Choose another port with NINEROUTER_PORT."
-        ;;
-    esac
+    if [ -f "$PID_FILE" ]; then
+      local saved_pid
+      saved_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+      case "$saved_pid" in
+        ''|*[!0-9]*) saved_pid= ;;
+      esac
+      if [ -n "$saved_pid" ]; then
+        process_args=$(ps -p "$saved_pid" -o args= 2>/dev/null || true)
+        case "$process_args" in
+          *9router/cli.js*|*9router\\cli.js*|next-server*)
+            printf 'Stopping unresponsive 9Router process %s on port %s.\n' "$saved_pid" "$PORT" >&2
+            pkill -P "$saved_pid" 2>/dev/null || true
+            kill "$saved_pid" 2>/dev/null || true
+            rm -f "$PID_FILE"
+            return 0
+            ;;
+        esac
+      fi
+    fi
+    printf 'Port conflict detected on %s (PID %s); recent launcher log output follows:\n' "$PORT" "$listener_pid" >&2
+    tail -n 25 "$LOG_FILE" >&2 2>/dev/null || true
+    fail "Port $PORT is occupied by another process; left it running. See $LOG_FILE and choose another port with NINEROUTER_PORT."
   done < <(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
 }
 
 if ! gateway_ready; then
-  stop_unresponsive_router_on_port
   mkdir -p "$LOG_DIR"
   : >"$LOG_FILE"
-  NODE_PATH_VALUE="$DATA_DIR/runtime/node_modules:$APP_ROOT/node_modules"
-  EXISTING_NODE_PATH=$(printenv NODE_PATH 2>/dev/null || true)
-  if [ -n "$EXISTING_NODE_PATH" ]; then NODE_PATH_VALUE="$NODE_PATH_VALUE:$EXISTING_NODE_PATH"; fi
+  stop_unresponsive_router_on_port
+  if port_is_open; then
+    printf 'Port conflict detected on %s; recent launcher log output follows:\n' "$PORT" >&2
+    tail -n 25 "$LOG_FILE" >&2 2>/dev/null || true
+    fail "Port $PORT is occupied by another process; left it running. See $LOG_FILE and choose another port with NINEROUTER_PORT."
+  fi
+  PREEXISTING_CHILDREN=$(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
   printf 'Starting local 9Router on 127.0.0.1:%s ...\n' "$PORT"
-  (
-    cd "$APP_ROOT"
-    export PORT
-    export HOSTNAME=127.0.0.1
-    export NODE_PATH="$NODE_PATH_VALUE"
-    nohup "$NODE_BIN" --dns-result-order=ipv4first "$SERVER_JS" >>"$LOG_FILE" 2>&1 </dev/null &
-    printf '%s\n' "$!" >"$PID_FILE"
-  )
-  printf '9Router is running in the background; waiting for its endpoint to become ready ...\n'
+  HOSTNAME=127.0.0.1 nohup "${ROUTER_COMMAND[@]}" --port "$PORT" --host 127.0.0.1 --no-browser --skip-update >>"$LOG_FILE" 2>&1 </dev/null &
+  SERVER_PID=$!
+  SERVER_IS_CHILD=0
+  printf '%s\n' "$SERVER_PID" >"$PID_FILE"
   ready=0
-  for ((attempt=0; attempt<40; attempt++)); do
+  for ((attempt=1; attempt<=90; attempt++)); do
     if gateway_ready; then ready=1; break; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      found_child=0
+      while IFS= read -r candidate_pid; do
+        [ -n "$candidate_pid" ] || continue
+        case " $PREEXISTING_CHILDREN " in *" $candidate_pid "*) continue ;; esac
+        SERVER_PID=$candidate_pid
+        SERVER_IS_CHILD=1
+        found_child=1
+        printf '%s\n' "$SERVER_PID" >"$PID_FILE"
+        break
+      done < <(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
+      if [ "$found_child" -eq 0 ] && ! grep -q 'Server: http://' "$LOG_FILE" 2>/dev/null; then break; fi
+    fi
+    printf '  waiting %ss (http=%s)\n' "$attempt" "$LAST_STATUS"
     if grep -q 'EADDRINUSE' "$LOG_FILE" 2>/dev/null; then
       rm -f "$PID_FILE"
       tail -n 25 "$LOG_FILE" >&2
       fail "Port $PORT is occupied. The launcher left any process it could not identify as 9Router running; choose another port with NINEROUTER_PORT."
     fi
-    sleep 1
+    [ "$attempt" -eq 90 ] || sleep 1
   done
   if [ "$ready" -ne 1 ]; then
     rm -f "$PID_FILE"
@@ -204,6 +245,25 @@ if ! gateway_ready; then
     fi
     fail "9Router did not start. See $LOG_FILE for details."
   fi
+  if [ -f "$PID_FILE" ] && [ "$SERVER_IS_CHILD" -eq 0 ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    while IFS= read -r candidate_pid; do
+      [ -n "$candidate_pid" ] || continue
+      case " $PREEXISTING_CHILDREN " in *" $candidate_pid "*) continue ;; esac
+      SERVER_PID=$candidate_pid
+      printf '%s\n' "$SERVER_PID" >"$PID_FILE"
+      break
+    done < <(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    LISTENERS=$(netstat -ltn 2>/dev/null | awk -v suffix=":$PORT" '$4 ~ (suffix "$") { print $4 }')
+  fi
+  if [ -z "$LISTENERS" ]; then
+    PORT_HEX=$(printf '%04X' "$PORT")
+    LISTENERS=$(awk -v port="$PORT_HEX" '$2 ~ (":" port "$") && $4 == "0A" {print $2}' /proc/net/tcp /proc/net/tcp6 2>/dev/null || true)
+  fi
+  case "$LISTENERS" in
+    *0.0.0.0:*|*:::*|00000000:*|00000000000000000000000000000000:*) printf 'Warning: 9Router is listening on a non-loopback address (%s).\n' "$LISTENERS" >&2 ;;
+  esac
 fi
 
 if [ "$MODE" = dashboard ]; then

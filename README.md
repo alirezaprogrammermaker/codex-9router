@@ -34,9 +34,14 @@ gateway is ready:
 
 The launcher waits only for 9Router's readiness check, then Codex runs while
 9Router continues serving requests in the background.
+It starts the official `9router` CLI with `--no-browser --skip-update` and
+binds the local gateway to `127.0.0.1`.
 If the configured port is held by an unresponsive 9Router server, the launcher
 stops that server before starting a replacement. It leaves unrelated processes
 alone and reports a port conflict instead.
+
+For startup troubleshooting, inspect
+`~/.9router/logs/codex-launcher-<port>.log`.
 
 ```sh
 ./codex-9router.sh --dashboard  # show/open the local dashboard
