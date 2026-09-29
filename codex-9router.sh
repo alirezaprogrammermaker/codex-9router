@@ -24,18 +24,19 @@ Usage:
   codex-9router.sh                Open the interactive control panel
   codex-9router.sh --dashboard    Start 9Router and show its dashboard URL
   codex-9router.sh --check        Run a read-only live response check
-  codex-9router.sh --stop         Stop only a 9Router server started by this script
+  codex-9router.sh --stop         Stop the recorded 9Router server after ownership validation
   codex-9router.sh --help         Show this help
 
 Optional environment:
   NINEROUTER_PORT   Local 9Router port (default: 20128)
   NINEROUTER_MODEL  Preselect a model id (default: apmix/deepseek-v4-flash-free)
 
-With a prompt, the launcher starts 9Router in the background and runs Codex
-directly after the gateway is ready. Without a prompt, it opens the interactive
-panel, which lists live models, tests a model with a read-only Codex request,
-and launches Codex. Manage provider endpoints and provider credentials in the
-9Router dashboard; this launcher does not edit 9Router's database.
+With prompt arguments, the launcher starts 9Router if needed and runs Codex
+directly after the gateway is ready. Without prompt arguments, it opens the
+interactive panel, which lists live models, tests a model with a read-only
+Codex request, and launches Codex. Manage provider endpoints and provider
+credentials in the 9Router dashboard; this launcher does not edit 9Router's
+database.
 
 The script reads a local 9Router client key from its database and never stores
 provider secrets. Add provider endpoints and credentials in the 9Router dashboard.
@@ -45,6 +46,21 @@ EOF
 fail() {
   printf '%s: %s\n' "$APP_NAME" "$1" >&2
   exit 1
+}
+
+is_router_process() {
+  local process_pid process_args process_cwd
+  process_pid=$1
+  kill -0 "$process_pid" 2>/dev/null || return 1
+  process_args=$(ps -p "$process_pid" -o args= 2>/dev/null || true)
+  case "$process_args" in
+    *next-server*)
+      process_cwd=$(readlink "/proc/$process_pid/cwd" 2>/dev/null || true)
+      case "$process_cwd" in */9router/*) return 0 ;; esac
+      ;;
+  esac
+  case "$process_args" in *9router*) return 0 ;; esac
+  return 1
 }
 
 if [ "$#" -gt 0 ]; then
@@ -65,41 +81,19 @@ if [ "$MODE" = stop ]; then
   case "$SERVER_PID" in
     ''|*[!0-9]*) rm -f "$PID_FILE"; fail "The saved server PID is invalid; removed the stale PID file." ;;
   esac
-  PROCESS_ARGS=$(ps -p "$SERVER_PID" -o args= 2>/dev/null || true)
-  case "$PROCESS_ARGS" in
-    *9router/cli.js*|*9router\\cli.js*|next-server*)
-      pkill -P "$SERVER_PID" 2>/dev/null || true
-      kill "$SERVER_PID" 2>/dev/null || true
-      for ((attempt=0; attempt<10; attempt++)); do
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        sleep 1
-      done
-      rm -f "$PID_FILE"
-      printf 'Stopped the 9Router server started by this launcher.\n'
-      ;;
-    *)
-      candidates=()
-      while IFS= read -r candidate_pid; do
-        [ -n "$candidate_pid" ] || continue
-        candidate_args=$(ps -p "$candidate_pid" -o args= 2>/dev/null || true)
-        case "$candidate_args" in next-server*) candidates+=("$candidate_pid") ;; esac
-      done < <(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
-      if [ "${#candidates[@]}" -eq 1 ] && grep -Fq "Server: http://127.0.0.1:$PORT" "$LOG_FILE" 2>/dev/null && \
-        [ "$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$PORT/login" 2>/dev/null || true)" != 000 ]; then
-        pkill -P "${candidates[0]}" 2>/dev/null || true
-        kill "${candidates[0]}" 2>/dev/null || true
-        for ((attempt=0; attempt<10; attempt++)); do
-          kill -0 "${candidates[0]}" 2>/dev/null || break
-          sleep 1
-        done
-        rm -f "$PID_FILE"
-        printf 'Stopped the detached 9Router server started by this launcher.\n'
-      else
-        rm -f "$PID_FILE"
-        fail "PID $SERVER_PID is no longer the launcher-owned 9Router server; removed the stale PID file without stopping an unverified process."
-      fi
-      ;;
-  esac
+  if ! is_router_process "$SERVER_PID"; then
+    rm -f "$PID_FILE"
+    fail "PID $SERVER_PID is not a live 9Router process; removed the stale PID file without stopping it."
+  fi
+  pkill -P "$SERVER_PID" 2>/dev/null || true
+  kill "$SERVER_PID" 2>/dev/null || true
+  for ((attempt=0; attempt<5; attempt++)); do
+    kill -0 "$SERVER_PID" 2>/dev/null || break
+    sleep 1 || true
+  done
+  if kill -0 "$SERVER_PID" 2>/dev/null; then kill -9 "$SERVER_PID" 2>/dev/null || true; fi
+  rm -f "$PID_FILE"
+  printf 'Stopped the 9Router server started by this launcher.\n'
   exit 0
 fi
 
@@ -164,45 +158,58 @@ gateway_ready() {
 
 LAST_STATUS=000
 
+find_server_pid() {
+  local candidate_pid candidate_args candidate_cwd candidate_port
+  while IFS= read -r candidate_pid; do
+    [ -n "$candidate_pid" ] || continue
+    candidate_args=$(ps -p "$candidate_pid" -o args= 2>/dev/null || true)
+    case "$candidate_args" in *next-server*) ;; *) continue ;; esac
+    candidate_cwd=$(readlink "/proc/$candidate_pid/cwd" 2>/dev/null || true)
+    case "$candidate_cwd" in */9router/*) ;; *) continue ;; esac
+    [ -r "/proc/$candidate_pid/environ" ] || continue
+    candidate_port=$(tr '\0' '\n' <"/proc/$candidate_pid/environ" 2>/dev/null | awk -F= '$1 == "PORT" {print substr($0, index($0, "=") + 1); exit}' || true)
+    if [ "$candidate_port" = "$PORT" ]; then
+      printf '%s\n' "$candidate_pid"
+      return 0
+    fi
+  done < <(ps -eo pid=,args= 2>/dev/null | awk '$0 ~ /next-server/ {print $1}')
+  return 1
+}
+
 port_is_open() {
   (exec 9<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null
 }
 
 stop_unresponsive_router_on_port() {
-  local listener_pid process_args attempt
-  command -v lsof >/dev/null 2>&1 || return 0
-  while IFS= read -r listener_pid; do
-    [ -n "$listener_pid" ] || continue
-    if [ -f "$PID_FILE" ]; then
-      local saved_pid
-      saved_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-      case "$saved_pid" in
-        ''|*[!0-9]*) saved_pid= ;;
-      esac
-      if [ -n "$saved_pid" ]; then
-        process_args=$(ps -p "$saved_pid" -o args= 2>/dev/null || true)
-        case "$process_args" in
-          *9router/cli.js*|*9router\\cli.js*|next-server*)
-            printf 'Stopping unresponsive 9Router process %s on port %s.\n' "$saved_pid" "$PORT" >&2
-            pkill -P "$saved_pid" 2>/dev/null || true
-            kill "$saved_pid" 2>/dev/null || true
-            rm -f "$PID_FILE"
-            return 0
-            ;;
-        esac
-      fi
+  local saved_pid attempt
+  if port_is_open; then
+    saved_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    case "$saved_pid" in ''|*[!0-9]*) saved_pid= ;; esac
+    if [ -n "$saved_pid" ] && is_router_process "$saved_pid"; then
+      pkill -P "$saved_pid" 2>/dev/null || true
+      kill "$saved_pid" 2>/dev/null || true
+      for ((attempt=0; attempt<5; attempt++)); do
+        kill -0 "$saved_pid" 2>/dev/null || break
+        sleep 1 || true
+      done
+      if kill -0 "$saved_pid" 2>/dev/null; then kill -9 "$saved_pid" 2>/dev/null || true; fi
+      rm -f "$PID_FILE"
+      return 0
     fi
-    printf 'Port conflict detected on %s (PID %s); recent launcher log output follows:\n' "$PORT" "$listener_pid" >&2
+    printf 'Port %s is accepting TCP connections but not responding to HTTP.\n' "$PORT" >>"$LOG_FILE"
+    printf 'Port conflict detected on %s; recent launcher log output follows:\n' "$PORT" >&2
     tail -n 25 "$LOG_FILE" >&2 2>/dev/null || true
     fail "Port $PORT is occupied by another process; left it running. See $LOG_FILE and choose another port with NINEROUTER_PORT."
-  done < <(lsof -nP -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)
+  fi
 }
 
+SERVER_PID=""
 if ! gateway_ready; then
   mkdir -p "$LOG_DIR"
   : >"$LOG_FILE"
   stop_unresponsive_router_on_port
   if port_is_open; then
+    printf 'Port %s became occupied before 9Router could start.\n' "$PORT" >>"$LOG_FILE"
     printf 'Port conflict detected on %s; recent launcher log output follows:\n' "$PORT" >&2
     tail -n 25 "$LOG_FILE" >&2 2>/dev/null || true
     fail "Port $PORT is occupied by another process; left it running. See $LOG_FILE and choose another port with NINEROUTER_PORT."
@@ -227,7 +234,9 @@ if ! gateway_ready; then
         printf '%s\n' "$SERVER_PID" >"$PID_FILE"
         break
       done < <(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
-      if [ "$found_child" -eq 0 ] && ! grep -q 'Server: http://' "$LOG_FILE" 2>/dev/null; then break; fi
+      if [ "$found_child" -eq 0 ]; then
+        if [ "$SERVER_IS_CHILD" -eq 1 ]; then break; fi
+      fi
     fi
     printf '  waiting %ss (http=%s)\n' "$attempt" "$LAST_STATUS"
     if grep -q 'EADDRINUSE' "$LOG_FILE" 2>/dev/null; then
@@ -254,8 +263,9 @@ if ! gateway_ready; then
       break
     done < <(ps -A -o pid= -o args= 2>/dev/null | awk '$2 == "next-server" {print $1}')
   fi
+  LISTENERS=""
   if command -v netstat >/dev/null 2>&1; then
-    LISTENERS=$(netstat -ltn 2>/dev/null | awk -v suffix=":$PORT" '$4 ~ (suffix "$") { print $4 }')
+    LISTENERS=$(netstat -ltn 2>/dev/null | awk -v suffix=":$PORT" '$4 ~ (suffix "$") { print $4 }' || true)
   fi
   if [ -z "$LISTENERS" ]; then
     PORT_HEX=$(printf '%04X' "$PORT")
@@ -264,6 +274,17 @@ if ! gateway_ready; then
   case "$LISTENERS" in
     *0.0.0.0:*|*:::*|00000000:*|00000000000000000000000000000000:*) printf 'Warning: 9Router is listening on a non-loopback address (%s).\n' "$LISTENERS" >&2 ;;
   esac
+else
+  printf 'Using running 9Router on 127.0.0.1:%s\n' "$PORT"
+  SERVER_PID=$(cat "$PID_FILE" 2>/dev/null || true)
+fi
+
+ACTUAL_SERVER_PID=$(find_server_pid || true)
+if [ -n "$ACTUAL_SERVER_PID" ]; then
+  SERVER_PID=$ACTUAL_SERVER_PID
+  printf '%s\n' "$SERVER_PID" >"$PID_FILE"
+else
+  printf 'Warning: could not identify the 9Router server PID; keeping the existing PID.\n' >&2
 fi
 
 if [ "$MODE" = dashboard ]; then
@@ -328,7 +349,7 @@ if [ "$MODE" = check ]; then
     'Reply with exactly OK and no other text.'
 fi
 
-if [ -t 0 ]; then
+if [ -t 0 ] && [ "$#" -eq 0 ]; then
   while :; do
     printf '\n9Router Control Panel\n'
     printf '  Model: %s\n' "$MODEL"

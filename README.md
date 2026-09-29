@@ -22,11 +22,12 @@ chmod +x codex-9router.sh
 ./codex-9router.sh
 ```
 
-With no arguments, the interactive panel lists the models exposed by 9Router,
+With no prompt arguments, the interactive panel lists the models exposed by
+9Router,
 lets you select a model, runs an optional read-only Codex test, opens the
 9Router dashboard for provider/API-key management, and launches Codex. Pass a
-prompt to start 9Router in the background and launch Codex directly after the
-gateway is ready:
+prompt to skip the panel, start 9Router in the background if needed, and launch
+Codex directly after the gateway is ready:
 
 ```sh
 ./codex-9router.sh "Inspect this project and fix the failing task"
@@ -49,6 +50,10 @@ For startup troubleshooting, inspect
 ./codex-9router.sh --stop       # stop only a server started by this launcher
 ./codex-9router.sh --help       # show options
 ```
+
+`--stop` validates the recorded live process before stopping it. For 9Router's
+detached `next-server`, it checks that the process runs from the installed
+9Router app directory.
 
 Set `NINEROUTER_PORT` to change the local gateway port. Set
 `NINEROUTER_MODEL` to preselect the model ID (default:
